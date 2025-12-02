@@ -1,141 +1,173 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import LabelEncoder
 
-st.set_page_config(page_title="Early Warning Retensi Mahasiswa", layout="wide")
+# Konfigurasi Halaman Streamlit
+st.set_page_config(
+    page_title="Sistem Peringatan Dini Retensi Mahasiswa",
+    page_icon="🎓",
+    layout="wide"
+)
 
-RISK_THRESH_DEFAULT = 0.60
-MID_THRESH_DEFAULT = 0.40
+# Judul dan Deskripsi
+st.title("🎓 Sistem Peringatan Dini Retensi Mahasiswa")
+st.markdown("""
+Aplikasi ini menggunakan algoritma **Random Forest** untuk memprediksi potensi mahasiswa 
+apakah akan **Dropout**, **Enrolled** (Masih Kuliah), atau **Graduate** (Lulus).
+Dibuat untuk memenuhi tugas Project Kelompok.
+""")
 
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip().replace("\\", "").replace("  ", " ").strip() for c in df.columns]
-    # Normalisasi nama umum
-    if "Course \\" in df.columns:
-        df = df.rename(columns={"Course \\": "Course"})
-    if "Target " in df.columns and "Target" not in df.columns:
-        df = df.rename(columns={"Target ": "Target"})
-    if " Curricular units 2nd sem (grade) " in df.columns:
-        df = df.rename(columns={" Curricular units 2nd sem (grade) ": "Curricular units 2nd sem (grade)"})
-    if "Curricular units 1st sem (grade) " in df.columns:
-        df = df.rename(columns={"Curricular units 1st sem (grade) ": "Curricular units 1st sem (grade)"})
+# --- 1. LOAD & PREPROCESS DATA ---
+@st.cache_data
+def load_data():
+    # Membaca dataset
+    df = pd.read_csv('dataset.csv')
     return df
 
+try:
+    df = load_data()
+except FileNotFoundError:
+    st.error("File 'dataset.csv' tidak ditemukan. Pastikan file csv ada di folder yang sama.")
+    st.stop()
+
+# --- 2. FITUR SELEKSI & PERSIAPAN MODEL ---
+# Kita akan menggunakan fitur-fitur yang paling berpengaruh (Top Features) 
+# agar input user tidak terlalu banyak (30+ input membingungkan user).
+# Fitur dipilih berdasarkan korelasi umum pada dataset ini.
+
+selected_features = [
+    'Curricular units 2nd sem (approved)',
+    'Curricular units 2nd sem (grade)',
+    'Curricular units 1st sem (approved)',
+    'Curricular units 1st sem (grade)',
+    'Tuition fees up to date',
+    'Scholarship holder',
+    'Debtor',
+    'Age at enrollment',
+    'Gender',
+    'Displaced'
+]
+
+target_col = 'Target'
+
+# Filter dataframe hanya kolom yang dipilih + target
+df_model = df[selected_features + [target_col]].copy()
+
+# Encoding Target (Dropout, Enrolled, Graduate) menjadi angka jika belum
+le = LabelEncoder()
+df_model[target_col] = le.fit_transform(df_model[target_col])
+
+# Mapping untuk menampilkan hasil nanti
+# Biasanya urutan le.classes_ alfabetis: Dropout, Enrolled, Graduate
+target_names = le.classes_
+
+# Pisahkan X dan y
+X = df_model[selected_features]
+y = df_model[target_col]
+
+# Split Data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# --- 3. TRAINING MODEL RANDOM FOREST ---
 @st.cache_resource
-def load_artifacts():
-    model = joblib.load("artifacts/retention_model.joblib")
-    label_enc = joblib.load("artifacts/label_encoder.joblib")
-    try:
-        feat_imp = pd.read_csv("artifacts/feature_importance.csv")
-    except:
-        feat_imp = None
-    return model, label_enc, feat_imp
+def train_model(X_train, y_train):
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+    return rf
 
-def infer_and_flag(model, df, risk_thresh, mid_thresh):
-    # Pastikan kolom input sesuai dengan yang dipakai saat training
-    model_features = model.named_steps["model"].base_estimator.feature_names_in_ \
-        if hasattr(model.named_steps["model"].base_estimator, "feature_names_in_") else df.columns
-    # Reorder/align columns: jika ada mismatch, isi kolom hilang dengan 0
-    X = pd.DataFrame(columns=model_features)
-    for c in model_features:
-        X[c] = df[c] if c in df.columns else 0
-    # Type safety
-    for c in X.columns:
-        if X[c].dtype == "O":
-            X[c] = pd.to_numeric(X[c], errors="coerce")
-    X = X.fillna(0)
+rf_model = train_model(X_train, y_train)
 
-    preds = model.predict(X)
-    probs = model.predict_proba(X)
-    # Asumsikan order label sama seperti training: ['Dropout','Enrolled','Graduate'] (cek dengan label encoder saat training)
-    # Kita cari indeks kelas 'Dropout' berdasarkan encoder
-    classes = model.classes_ if hasattr(model, "classes_") else None
-    # CalibratedClassifierCV expose classes_ di wrapper
-    clf = model.named_steps["model"]
-    class_names = clf.classes_
-    try:
-        dropout_idx = int(np.where(class_names == "Dropout")[0][0])
-    except:
-        # fallback: assume class order from training encoder
-        dropout_idx = 0
+# Hitung Akurasi
+y_pred = rf_model.predict(X_test)
+accuracy = accuracy_score(y_test, y_pred)
 
-    p_dropout = probs[:, dropout_idx]
-    risk_level = np.where(p_dropout >= risk_thresh, "High",
-                  np.where(p_dropout >= mid_thresh, "Medium", "Low"))
-    out = df.copy()
-    out["Predicted"] = class_names[preds]
-    out["P(Dropout)"] = p_dropout
-    out["Risk Level"] = risk_level
-    return out, class_names
+# --- 4. SIDEBAR INPUT USER ---
+st.sidebar.header("📝 Input Data Mahasiswa")
 
-def main():
-    st.title("Sistem Peringatan Dini Retensi Mahasiswa")
-    st.markdown("Upload data mahasiswa untuk memprediksi risiko dropout dan melihat faktor-faktor yang berpengaruh.")
+def user_input_features():
+    # Kelompok Akademik
+    st.sidebar.subheader("Akademik")
+    sem2_approved = st.sidebar.number_input("SKS Lulus (Sem 2)", min_value=0, max_value=30, value=5)
+    sem2_grade = st.sidebar.number_input("Nilai Rata-rata (Sem 2)", min_value=0.0, max_value=20.0, value=12.0)
+    sem1_approved = st.sidebar.number_input("SKS Lulus (Sem 1)", min_value=0, max_value=30, value=5)
+    sem1_grade = st.sidebar.number_input("Nilai Rata-rata (Sem 1)", min_value=0.0, max_value=20.0, value=12.0)
+    
+    # Kelompok Finansial
+    st.sidebar.subheader("Finansial")
+    tuition = st.sidebar.selectbox("Uang Kuliah Lancar?", [1, 0], format_func=lambda x: "Ya" if x==1 else "Tidak")
+    scholarship = st.sidebar.selectbox("Penerima Beasiswa?", [1, 0], format_func=lambda x: "Ya" if x==1 else "Tidak")
+    debtor = st.sidebar.selectbox("Memiliki Utang?", [1, 0], format_func=lambda x: "Ya" if x==1 else "Tidak")
+    
+    # Kelompok Demografi
+    st.sidebar.subheader("Demografi")
+    age = st.sidebar.slider("Usia saat Mendaftar", 17, 70, 20)
+    gender = st.sidebar.selectbox("Gender", [1, 0], format_func=lambda x: "Laki-laki" if x==1 else "Perempuan")
+    displaced = st.sidebar.selectbox("Perantau (Displaced)?", [1, 0], format_func=lambda x: "Ya" if x==1 else "Tidak")
 
-    model, label_enc, feat_imp = load_artifacts()
+    data = {
+        'Curricular units 2nd sem (approved)': sem2_approved,
+        'Curricular units 2nd sem (grade)': sem2_grade,
+        'Curricular units 1st sem (approved)': sem1_approved,
+        'Curricular units 1st sem (grade)': sem1_grade,
+        'Tuition fees up to date': tuition,
+        'Scholarship holder': scholarship,
+        'Debtor': debtor,
+        'Age at enrollment': age,
+        'Gender': gender,
+        'Displaced': displaced
+    }
+    return pd.DataFrame(data, index=[0])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        risk_thresh = st.slider("Threshold High Risk (P(Dropout) ≥ ...)", 0.0, 1.0, RISK_THRESH_DEFAULT, 0.01)
-    with col2:
-        mid_thresh = st.slider("Threshold Medium Risk (P(Dropout) ≥ ...)", 0.0, 1.0, MID_THRESH_DEFAULT, 0.01)
+input_df = user_input_features()
 
-    uploaded = st.file_uploader("Upload CSV (schema mirip dataset training)", type=["csv"])
+# --- 5. MAIN PAGE DISPLAY ---
 
-    if uploaded:
-        df = pd.read_csv(uploaded)
-        df = clean_columns(df)
+col1, col2 = st.columns([2, 1])
 
-        # Jika ada Target, pisahkan agar tidak mempengaruhi prediksi
-        if "Target" in df.columns:
-            df_input = df.drop(columns=["Target"])
-            st.info("Kolom Target terdeteksi dan diabaikan untuk inferensi.")
+with col1:
+    st.subheader("🔍 Hasil Prediksi")
+    
+    # Tampilkan input user (opsional)
+    with st.expander("Lihat Data Input"):
+        st.dataframe(input_df)
+
+    if st.button("Jalankan Prediksi"):
+        prediction = rf_model.predict(input_df)
+        prediction_proba = rf_model.predict_proba(input_df)
+        
+        result = target_names[prediction][0]
+        
+        st.markdown("---")
+        if result == "Dropout":
+            st.error(f"### ⚠️ Peringatan: Mahasiswa Berisiko DROPOUT")
+            st.write("Sistem mendeteksi pola yang mengarah pada pemberhentian studi. Disarankan untuk memberikan konseling akademik segera.")
+        elif result == "Enrolled":
+            st.info(f"### ℹ️ Status: ENROLLED (Aktif)")
+            st.write("Mahasiswa masih dalam jalur pendidikan, namun perlu pemantauan berkala.")
         else:
-            df_input = df
+            st.success(f"### ✅ Status: Lulus (GRADUATE)")
+            st.write("Mahasiswa memiliki performa yang baik dan diprediksi akan lulus.")
+            
+        st.markdown("---")
+        st.write("Probabilitas Prediksi:")
+        prob_df = pd.DataFrame(prediction_proba, columns=target_names)
+        st.bar_chart(prob_df.T)
 
-        result, class_names = infer_and_flag(model, df_input, risk_thresh, mid_thresh)
+with col2:
+    st.subheader("📊 Performa Model")
+    st.metric(label="Akurasi Model", value=f"{accuracy:.2%}")
+    st.write("Fitur Terpenting:")
+    
+    # Feature Importance Visualization
+    importances = rf_model.feature_importances_
+    feature_imp = pd.DataFrame({'Fitur': selected_features, 'Pentingnya': importances})
+    feature_imp = feature_imp.sort_values(by='Pentingnya', ascending=False).head(5)
+    st.dataframe(feature_imp, hide_index=True)
 
-        st.subheader("Hasil Prediksi")
-        st.dataframe(result.style.background_gradient(subset=["P(Dropout)"], cmap="Reds"))
-
-        # Ringkasan risiko
-        st.subheader("Ringkasan Risiko")
-        risk_counts = result["Risk Level"].value_counts().reindex(["High", "Medium", "Low"]).fillna(0).astype(int)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("High risk", int(risk_counts.get("High", 0)))
-        c2.metric("Medium risk", int(risk_counts.get("Medium", 0)))
-        c3.metric("Low risk", int(risk_counts.get("Low", 0)))
-
-        # Unduh
-        st.download_button("Unduh Hasil CSV", data=result.to_csv(index=False), file_name="retention_predictions.csv", mime="text/csv")
-
-        # Feature importance global
-        st.subheader("Top fitur paling berpengaruh (global)")
-        if feat_imp is not None:
-            st.dataframe(feat_imp.head(15))
-        else:
-            st.write("Feature importance tidak tersedia.")
-
-        # Penjelasan lokal sederhana: tampilkan top-k fitur input terbesar untuk beberapa contoh high risk
-        st.subheader("Penjelasan lokal (indikasi faktor dominan)")
-        k = st.slider("Tampilkan top K fitur per mahasiswa", 3, 10, 5)
-        sample_high = result[result["Risk Level"] == "High"].head(5)
-        if len(sample_high) > 0:
-            st.caption("Catatan: ini pendekatan sederhana (fitur bernilai tinggi). Untuk eksplanasi lebih kuat, integrasikan SHAP di versi lanjutan.")
-            for idx in sample_high.index:
-                row = df_input.loc[idx]
-                top_feats = row.abs().sort_values(ascending=False).head(k)
-                st.write(f"Mahasiswa index {idx}: Predicted={result.loc[idx,'Predicted']}, P(Dropout)={result.loc[idx,'P(Dropout)']:.2f}")
-                st.write(top_feats)
-        else:
-            st.write("Belum ada mahasiswa High risk untuk ditampilkan.")
-
-    else:
-        st.info("Silakan upload file CSV untuk memulai.")
-
-if __name__ == "__main__":
-    main()
+# Footer
+st.markdown("---")
+st.caption("Dikembangkan menggunakan Python & Streamlit | Algoritma Random Forest")
